@@ -109,12 +109,40 @@ def save_annotation(participant_id: str, row_index: int, label: int) -> None:
 
         if google_sheets_configured():
             worksheet = get_annotations_worksheet()
-            if not worksheet.row_values(1):
+            values = worksheet.get_all_values()
+            if not values:
                 worksheet.append_row(ANNOTATION_COLUMNS)
-            worksheet.append_row(
-                [participant_id, row_index, label, timestamp],
-                value_input_option="RAW",
-            )
+                values = [ANNOTATION_COLUMNS]
+
+            headers = values[0]
+            if not set(ANNOTATION_COLUMNS).issubset(headers):
+                raise ValueError(
+                    "The annotations worksheet has unexpected column headers."
+                )
+
+            matching_rows = []
+            for sheet_row, values_row in enumerate(values[1:], start=2):
+                record = dict(zip(headers, values_row))
+                if (
+                    record.get("participant_id") == participant_id
+                    and str(record.get("row_index")) == str(row_index)
+                ):
+                    matching_rows.append(sheet_row)
+
+            annotation_row = [participant_id, row_index, label, timestamp]
+            if matching_rows:
+                worksheet.update(
+                    values=[annotation_row],
+                    range_name=f"A{matching_rows[0]}:D{matching_rows[0]}",
+                    value_input_option="RAW",
+                )
+                for duplicate_row in reversed(matching_rows[1:]):
+                    worksheet.delete_rows(duplicate_row)
+            else:
+                worksheet.append_row(
+                    annotation_row,
+                    value_input_option="RAW",
+                )
             return
 
         annotations = load_annotations()
