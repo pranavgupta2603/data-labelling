@@ -1,3 +1,7 @@
+import hashlib
+import random
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -6,6 +10,9 @@ import streamlit as st
 BASE_DIR = Path(__file__).resolve().parent
 DATA_FILE = BASE_DIR / "emotion.csv"
 OUTPUT_FILE = BASE_DIR / "emotion_annotations.csv"
+TWEETS_PER_PARTICIPANT = 5
+ANNOTATION_COLUMNS = ["participant_id", "row_index", "human_label", "labeled_at"]
+ANNOTATION_LOCK = threading.Lock()
 
 EMOTIONS = {
     0: "Sadness",
@@ -19,40 +26,63 @@ EMOTIONS = {
 
 @st.cache_data
 def load_data() -> pd.DataFrame:
-    """Load the source data and merge any previously saved annotations."""
+    """Load the source tweets."""
     data = pd.read_csv(DATA_FILE)
 
     if "text" not in data.columns:
         raise ValueError("The dataset must contain a 'text' column.")
-    data["human_label"] = pd.Series(pd.NA, index=data.index, dtype="Int64")
-
-    if OUTPUT_FILE.exists():
-        annotations = pd.read_csv(OUTPUT_FILE, dtype={"human_label": "Int64"})
-        if {"row_index", "human_label"}.issubset(annotations.columns):
-            valid = annotations["row_index"].between(0, len(data) - 1)
-            annotations = annotations.loc[valid]
-            data.loc[annotations["row_index"], "human_label"] = annotations[
-                "human_label"
-            ].to_numpy()
-
-    return data[:50]
+    return data
 
 
-def save_annotation(row_index: int, label: int) -> None:
-    """Insert or update one annotation without rewriting the large dataset."""
-    if OUTPUT_FILE.exists():
-        annotations = pd.read_csv(OUTPUT_FILE)
-        annotations = annotations[annotations["row_index"] != row_index]
-    else:
-        annotations = pd.DataFrame(columns=["row_index", "human_label"])
+def load_annotations() -> pd.DataFrame:
+    """Load annotations and migrate records created by the earlier interface."""
+    if not OUTPUT_FILE.exists():
+        return pd.DataFrame(columns=ANNOTATION_COLUMNS)
 
-    new_annotation = pd.DataFrame(
-        [{"row_index": row_index, "human_label": label}]
-    )
-    annotations = pd.concat([annotations, new_annotation], ignore_index=True)
-    annotations["row_index"] = annotations["row_index"].astype(int)
-    annotations["human_label"] = annotations["human_label"].astype(int)
-    annotations.sort_values("row_index").to_csv(OUTPUT_FILE, index=False)
+    annotations = pd.read_csv(OUTPUT_FILE)
+    if "participant_id" not in annotations.columns:
+        annotations["participant_id"] = "legacy"
+    if "labeled_at" not in annotations.columns:
+        annotations["labeled_at"] = ""
+
+    if not {"row_index", "human_label"}.issubset(annotations.columns):
+        return pd.DataFrame(columns=ANNOTATION_COLUMNS)
+
+    return annotations[ANNOTATION_COLUMNS]
+
+
+def get_assignment(participant_id: str, dataset_size: int) -> list[int]:
+    """Create a stable random assignment unique to the participant ID."""
+    digest = hashlib.sha256(participant_id.casefold().encode("utf-8")).digest()
+    generator = random.Random(int.from_bytes(digest[:8], "big"))
+    return generator.sample(range(dataset_size), TWEETS_PER_PARTICIPANT)
+
+
+def save_annotation(participant_id: str, row_index: int, label: int) -> None:
+    """Insert or update one participant's annotation."""
+    with ANNOTATION_LOCK:
+        annotations = load_annotations()
+        existing_record = (annotations["participant_id"] == participant_id) & (
+            annotations["row_index"] == row_index
+        )
+        annotations = annotations.loc[~existing_record]
+
+        new_annotation = pd.DataFrame(
+            [
+                {
+                    "participant_id": participant_id,
+                    "row_index": row_index,
+                    "human_label": label,
+                    "labeled_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ]
+        )
+        annotations = pd.concat([annotations, new_annotation], ignore_index=True)
+        annotations["row_index"] = annotations["row_index"].astype(int)
+        annotations["human_label"] = annotations["human_label"].astype(int)
+        annotations.sort_values(["participant_id", "row_index"]).to_csv(
+            OUTPUT_FILE, index=False
+        )
 
 
 @st.dialog("Emotion labelling tutorial", width="large", dismissible=False)
@@ -64,8 +94,9 @@ def show_tutorial() -> None:
     if step == 0:
         st.subheader("Understand the task")
         st.write(
-            "For every tweet, identify the **main emotion expressed by its author**. "
-            "Choose exactly one of the six available categories."
+            "You will receive **five randomly selected tweets**. For each one, "
+            "identify the **main emotion expressed by its author** and choose "
+            "exactly one category."
         )
         st.info(
             "Focus on how the author feels—not the tweet's general topic or how "
@@ -108,7 +139,7 @@ def show_tutorial() -> None:
             2. Choose the strongest or most central emotion.
             3. Select the matching category.
             4. Click **Save & Next** to record the label.
-            5. Use **Skip** only when you cannot make a reasonable choice.
+            5. Complete all five tweets. You may go back and revise an answer.
             """
         )
         st.success(
@@ -172,39 +203,96 @@ except (FileNotFoundError, ValueError) as error:
     st.error(f"Could not load the dataset: {error}")
     st.stop()
 
-if "row_index" not in st.session_state:
-    first_unlabelled = df["human_label"].isna()
-    st.session_state.row_index = (
-        int(first_unlabelled.idxmax()) if first_unlabelled.any() else 0
+if "participant_id" not in st.session_state:
+    st.subheader("Participant sign-in")
+    st.write(
+        "Enter your unique participant ID. It will be stored with your five labels "
+        "so the researcher can identify who completed each annotation."
+    )
+    with st.form("participant_sign_in"):
+        entered_id = st.text_input(
+            "Participant ID",
+            placeholder="For example: P001",
+            max_chars=80,
+        )
+        sign_in = st.form_submit_button(
+            "Continue", type="primary", use_container_width=True
+        )
+
+    if sign_in:
+        participant_id = entered_id.strip()
+        if participant_id:
+            st.session_state.participant_id = participant_id
+            st.session_state.assignment_position = 0
+            st.session_state.tutorial_seen = False
+            st.session_state.tutorial_open = True
+            st.session_state.tutorial_step = 0
+            st.rerun()
+        else:
+            st.error("Please enter a participant ID.")
+    st.stop()
+
+participant_id = st.session_state.participant_id
+assignment = get_assignment(participant_id, len(df))
+annotations = load_annotations()
+participant_annotations = annotations[
+    (annotations["participant_id"] == participant_id)
+    & (annotations["row_index"].isin(assignment))
+]
+labels_by_row = dict(
+    zip(
+        participant_annotations["row_index"].astype(int),
+        participant_annotations["human_label"].astype(int),
+    )
+)
+
+if "assignment_position" not in st.session_state:
+    first_unlabelled = next(
+        (position for position, row in enumerate(assignment) if row not in labels_by_row),
+        0,
+    )
+    st.session_state.assignment_position = first_unlabelled
+
+position = max(
+    0, min(int(st.session_state.assignment_position), TWEETS_PER_PARTICIPANT - 1)
+)
+st.session_state.assignment_position = position
+row_index = assignment[position]
+labelled_count = len(labels_by_row)
+
+st.progress(
+    labelled_count / TWEETS_PER_PARTICIPANT,
+    text=f"{labelled_count} of {TWEETS_PER_PARTICIPANT} tweets labelled",
+)
+if labelled_count == TWEETS_PER_PARTICIPANT:
+    st.success(
+        "You have completed all five tweets. Thank you! You may review and revise "
+        "your labels below."
     )
 
-row_index = max(0, min(st.session_state.row_index, len(df) - 1))
-st.session_state.row_index = row_index
-
-labelled_count = int(df["human_label"].notna().sum())
-st.progress(labelled_count / len(df), text=f"{labelled_count:,} of {len(df):,} labelled")
-
-st.subheader(f"Tweet {row_index + 1:,} of {len(df):,}")
+st.subheader(f"Assigned tweet {position + 1} of {TWEETS_PER_PARTICIPANT}")
 st.info(str(df.at[row_index, "text"]))
 
-current_label = df.at[row_index, "human_label"]
-default_choice = EMOTIONS.get(int(current_label)) if pd.notna(current_label) else None
+current_label = labels_by_row.get(row_index)
+default_choice = EMOTIONS.get(current_label)
 choice = st.radio(
     "Choose a category",
     list(EMOTIONS.values()),
     index=list(EMOTIONS.values()).index(default_choice) if default_choice else None,
+    key=f"label_{participant_id}_{row_index}",
 )
 
-previous_column, save_column, skip_column = st.columns(3)
+previous_column, save_column, next_column = st.columns(3)
 
 with previous_column:
-    if st.button("← Previous", use_container_width=True, disabled=row_index == 0):
-        st.session_state.row_index -= 1
+    if st.button("← Previous", use_container_width=True, disabled=position == 0):
+        st.session_state.assignment_position -= 1
         st.rerun()
 
 with save_column:
+    save_text = "Save" if position == TWEETS_PER_PARTICIPANT - 1 else "Save & Next"
     if st.button(
-        "Save & Next",
+        save_text,
         type="primary",
         use_container_width=True,
         disabled=choice is None,
@@ -212,20 +300,32 @@ with save_column:
         selected_label = next(
             label_id for label_id, emotion in EMOTIONS.items() if emotion == choice
         )
-        save_annotation(row_index, selected_label)
-        st.cache_data.clear()
-        if row_index < len(df) - 1:
-            st.session_state.row_index += 1
+        save_annotation(participant_id, row_index, selected_label)
+        if position < TWEETS_PER_PARTICIPANT - 1:
+            st.session_state.assignment_position += 1
         st.rerun()
 
-with skip_column:
+with next_column:
     if st.button(
-        "Skip →", use_container_width=True, disabled=row_index == len(df) - 1
+        "Next →",
+        use_container_width=True,
+        disabled=position == TWEETS_PER_PARTICIPANT - 1,
     ):
-        st.session_state.row_index += 1
+        st.session_state.assignment_position += 1
         st.rerun()
 
 with st.sidebar:
+    st.header("Participant")
+    st.write(f"Signed in as **{participant_id}**")
+    if st.button("Switch participant", use_container_width=True):
+        del st.session_state.participant_id
+        st.session_state.pop("assignment_position", None)
+        st.session_state.tutorial_seen = False
+        st.session_state.tutorial_open = True
+        st.session_state.tutorial_step = 0
+        st.rerun()
+
+    st.divider()
     st.header("Help")
     if st.button("📘 View tutorial", use_container_width=True):
         st.session_state.tutorial_open = True
@@ -233,31 +333,10 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    st.header("Navigation")
-    jump_to = st.number_input(
-        "Go to tweet",
-        min_value=1,
-        max_value=len(df),
-        value=row_index + 1,
-        step=1,
+    st.caption(
+        "Each saved record includes the participant ID, source tweet row, selected "
+        f"label, and timestamp in `{OUTPUT_FILE.name}`."
     )
-    if st.button("Go", use_container_width=True):
-        st.session_state.row_index = int(jump_to) - 1
-        st.rerun()
-
-    if st.button("Go to next unlabelled", use_container_width=True):
-        unlabelled = df.index[df["human_label"].isna()]
-        later_rows = unlabelled[unlabelled > row_index]
-        if len(later_rows):
-            st.session_state.row_index = int(later_rows[0])
-        elif len(unlabelled):
-            st.session_state.row_index = int(unlabelled[0])
-        else:
-            st.success("Every tweet has been labelled.")
-        st.rerun()
-
-    st.divider()
-    st.caption(f"Annotations are saved to `{OUTPUT_FILE}`.")
 
 if st.session_state.tutorial_open:
     show_tutorial()
