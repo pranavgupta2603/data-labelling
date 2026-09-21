@@ -13,6 +13,10 @@ OUTPUT_FILE = BASE_DIR / "emotion_annotations.csv"
 TWEETS_PER_PARTICIPANT = 5
 ANNOTATION_COLUMNS = ["participant_id", "row_index", "human_label", "labeled_at"]
 ANNOTATION_LOCK = threading.Lock()
+GOOGLE_API_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
 
 EMOTIONS = {
     0: "Sadness",
@@ -34,12 +38,49 @@ def load_data() -> pd.DataFrame:
     return data
 
 
+def google_sheets_configured() -> bool:
+    """Return whether Google Sheets credentials are available."""
+    try:
+        config = st.secrets["connections"]["gsheets"]
+        return bool(config.get("spreadsheet"))
+    except (FileNotFoundError, KeyError):
+        return False
+
+
+@st.cache_resource
+def get_annotations_worksheet():
+    """Connect to the private annotations worksheet."""
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    config = dict(st.secrets["connections"]["gsheets"])
+    spreadsheet = config.pop("spreadsheet")
+    worksheet_name = config.pop("worksheet", "annotations")
+    config.pop("type", None)
+
+    credentials = Credentials.from_service_account_info(
+        config, scopes=GOOGLE_API_SCOPES
+    )
+    client = gspread.authorize(credentials)
+    workbook = (
+        client.open_by_url(spreadsheet)
+        if spreadsheet.startswith("http")
+        else client.open(spreadsheet)
+    )
+    return workbook.worksheet(worksheet_name)
+
+
 def load_annotations() -> pd.DataFrame:
-    """Load annotations and migrate records created by the earlier interface."""
-    if not OUTPUT_FILE.exists():
+    """Load the latest annotation for each participant and tweet."""
+    if google_sheets_configured():
+        worksheet = get_annotations_worksheet()
+        records = worksheet.get_all_records()
+        annotations = pd.DataFrame(records)
+    elif OUTPUT_FILE.exists():
+        annotations = pd.read_csv(OUTPUT_FILE)
+    else:
         return pd.DataFrame(columns=ANNOTATION_COLUMNS)
 
-    annotations = pd.read_csv(OUTPUT_FILE)
     if "participant_id" not in annotations.columns:
         annotations["participant_id"] = "legacy"
     if "labeled_at" not in annotations.columns:
@@ -48,7 +89,10 @@ def load_annotations() -> pd.DataFrame:
     if not {"row_index", "human_label"}.issubset(annotations.columns):
         return pd.DataFrame(columns=ANNOTATION_COLUMNS)
 
-    return annotations[ANNOTATION_COLUMNS]
+    annotations = annotations[ANNOTATION_COLUMNS]
+    return annotations.drop_duplicates(
+        subset=["participant_id", "row_index"], keep="last"
+    )
 
 
 def get_assignment(participant_id: str, dataset_size: int) -> list[int]:
@@ -61,6 +105,18 @@ def get_assignment(participant_id: str, dataset_size: int) -> list[int]:
 def save_annotation(participant_id: str, row_index: int, label: int) -> None:
     """Insert or update one participant's annotation."""
     with ANNOTATION_LOCK:
+        timestamp = datetime.now(timezone.utc).isoformat()
+
+        if google_sheets_configured():
+            worksheet = get_annotations_worksheet()
+            if not worksheet.row_values(1):
+                worksheet.append_row(ANNOTATION_COLUMNS)
+            worksheet.append_row(
+                [participant_id, row_index, label, timestamp],
+                value_input_option="RAW",
+            )
+            return
+
         annotations = load_annotations()
         existing_record = (annotations["participant_id"] == participant_id) & (
             annotations["row_index"] == row_index
@@ -73,7 +129,7 @@ def save_annotation(participant_id: str, row_index: int, label: int) -> None:
                     "participant_id": participant_id,
                     "row_index": row_index,
                     "human_label": label,
-                    "labeled_at": datetime.now(timezone.utc).isoformat(),
+                    "labeled_at": timestamp,
                 }
             ]
         )
@@ -238,7 +294,14 @@ if "participant_id" not in st.session_state:
 
 participant_id = st.session_state.participant_id
 assignment = get_assignment(participant_id, len(df))
-annotations = load_annotations()
+try:
+    annotations = load_annotations()
+except Exception as error:
+    st.error(
+        "Could not connect to the private annotation sheet. Check the Google "
+        f"Sheet sharing and Streamlit secrets. Details: {error}"
+    )
+    st.stop()
 participant_annotations = annotations[
     (annotations["participant_id"] == participant_id)
     & (annotations["row_index"].isin(assignment))
@@ -304,7 +367,11 @@ with save_column:
         selected_label = next(
             label_id for label_id, emotion in EMOTIONS.items() if emotion == choice
         )
-        save_annotation(participant_id, row_index, selected_label)
+        try:
+            save_annotation(participant_id, row_index, selected_label)
+        except Exception as error:
+            st.error(f"Could not save this annotation: {error}")
+            st.stop()
         if position < TWEETS_PER_PARTICIPANT - 1:
             st.session_state.assignment_position += 1
         st.rerun()
@@ -337,9 +404,13 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    if google_sheets_configured():
+        st.success("Storage: private Google Sheet")
+    else:
+        st.warning("Storage: local CSV (development only)")
     st.caption(
-        "Each saved record includes the participant ID, source tweet row, selected "
-        f"label, and timestamp in `{OUTPUT_FILE.name}`."
+        "Each record includes the uniqname, source tweet row, selected label, "
+        "and timestamp."
     )
 
 if st.session_state.tutorial_open:
