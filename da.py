@@ -206,30 +206,34 @@ except (FileNotFoundError, ValueError) as error:
 if "participant_id" not in st.session_state:
     st.subheader("Participant sign-in")
     st.write(
-        "Enter your unique participant ID. It will be stored with your five labels "
-        "so the researcher can identify who completed each annotation."
+        "Enter only your UMich uniqname—the part before `@umich.edu`. It will be "
+        "stored with your five labels."
     )
     with st.form("participant_sign_in"):
         entered_id = st.text_input(
-            "Participant ID",
-            placeholder="For example: P001",
-            max_chars=80,
+            "UMich uniqname",
+            placeholder="For example: jsmith",
+            max_chars=20,
         )
         sign_in = st.form_submit_button(
             "Continue", type="primary", use_container_width=True
         )
 
     if sign_in:
-        participant_id = entered_id.strip()
-        if participant_id:
+        participant_id = entered_id.strip().lower()
+        if not participant_id:
+            st.error("Please enter your UMich uniqname.")
+        elif not participant_id.isalnum():
+            st.error(
+                "Enter only your uniqname, without `@umich.edu`, spaces, or symbols."
+            )
+        else:
             st.session_state.participant_id = participant_id
             st.session_state.assignment_position = 0
             st.session_state.tutorial_seen = False
             st.session_state.tutorial_open = True
             st.session_state.tutorial_step = 0
             st.rerun()
-        else:
-            st.error("Please enter a participant ID.")
     st.stop()
 
 participant_id = st.session_state.participant_id
